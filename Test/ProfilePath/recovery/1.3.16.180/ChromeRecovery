@@ -1,0 +1,171 @@
+#!/bin/bash
+
+# Copyright 2015 Google Inc. All rights reserved.
+
+# The script attempts to recover non-functional Google Software Update
+# installations. Note that Chrome does not capture the standard output
+# or standard error. Hence, the script logs everything to ASL for
+#diagnostic purposes
+
+# Required for elevation. Prints the process id.
+echo $$
+
+KS_INSTALLATION_STARTTIME=$(date +%s 2>/dev/null)
+
+# figure out where Chrome is and if it is a real Chrome or Chrome clone
+KS_CHROME_PATH=$(osascript -e \
+    "tell application \"Finder\" to POSIX path of (get application file id\"com.google.Chrome\" as alias)")
+if [ "$KS_CHROME_PATH" ]; then
+  # 'find' will write to stderr any missing search folder
+  KS_REGISTRATION_FRAMEWORK=$(/usr/bin/find "$KS_CHROME_PATH/Contents" \
+      -name "KeystoneRegistration.framework" 2>/dev/null | wc -l)
+else
+  KS_REGISTRATION_FRAMEWORK=0
+fi
+
+# Determine the expected version: user vs system
+if [ $EUID -ne 0 ]; then
+  KS_USER_OR_MACHINE=User
+  KS_IS_MACHINE=0
+  KS_SUDO_COMMAND=
+  KS_LOCAL=~
+else
+  KS_USER_OR_MACHINE=System
+  KS_IS_MACHINE=1
+  # Drop root privileges for the diagnostic pings at the end
+  KS_SUDO_COMMAND="/usr/bin/sudo -u nobody"
+fi
+
+# Special return code.
+KS_INSTALLATION_RETURN_CODE=80
+
+# First check if we should recover
+KS_BUNDLE_FOLDER=$KS_LOCAL/Library/Google/GoogleSoftwareUpdate/GoogleSoftwareUpdate.bundle/Contents
+KS_BUNDLE_PLIST=$KS_BUNDLE_FOLDER/Info.plist
+if [ -f $KS_BUNDLE_PLIST ]; then
+  # Keystone found
+  KS_RUN_INSTALLER=1
+  KS_FOUND_INSTALLATION=1
+  KS_EVENT_EXTRA_CODE=1
+  /bin/echo "$KS_USER_OR_MACHINE Google Software Update found on the system." \
+      | /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+else
+  KS_FOUND_INSTALLATION=0
+  # No Keystone, but maybe we have Google-distributed Chrome
+  if [ $KS_REGISTRATION_FRAMEWORK -gt 0 ]; then
+    /bin/echo "Found Keystone Registration framework." \
+        | /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+    KS_EVENT_EXTRA_CODE=2
+    KS_RUN_INSTALLER=1
+  else
+    KS_RUN_INSTALLER=0
+    # Report back if we have found a Chromium clone
+    if [ "$KS_CHROME_PATH" ]; then
+      /bin/echo "Error: No $KS_USER_OR_MACHINE Google Software Update or " \
+          "KeystoneRegistration.framework found the system. " \
+          "Skipping recovery." \
+          | /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+      KS_EVENT_EXTRA_CODE=3
+      KS_INSTALLATION_RETURN_CODE=81
+    else
+      /bin/echo "Error: No $KS_USER_OR_MACHINE Google Software Update or " \
+          "Google Chrome found the system. Skipping recovery." | \
+          /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+      KS_EVENT_EXTRA_CODE=4
+      KS_INSTALLATION_RETURN_CODE=82
+    fi
+  fi
+fi
+
+# The script source folder
+KS_SCRIPT_DIR=$(cd "$( /usr/bin/dirname "${BASH_SOURCE[0]}" )" && /bin/pwd)
+KS_INSTALLATION_ARCHIVE="$KS_SCRIPT_DIR/Keystone.tbz"
+
+# The executable permissions are cleared by Chrome unzipping
+/bin/echo "Set executable permissions" \
+    | /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+/bin/chmod +x "$KS_SCRIPT_DIR/FireEventPings.sh" 2>&1 | \
+    /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+/bin/chmod +x "$KS_SCRIPT_DIR/ksinstall" 2>&1 | \
+    /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+
+if [ $KS_FOUND_INSTALLATION -eq 1 ]; then
+  # Extract on disk version
+  KS_INSTALLED_VERSION=$(/usr/bin/awk -F"<|>" \
+    '/CFBundleVersion/ {getline; print $3; exit 199}' "$KS_BUNDLE_PLIST")
+  if [ $? -ne 199 ]; then
+    /bin/echo "Warning: Installation failed to extract the installed " \
+         "version. The info.plist file is corrupt. Recovery will proceed." | \
+        /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+    KS_INSTALLED_VERSION="0.0.0.0"
+  fi
+fi
+
+if [ $KS_RUN_INSTALLER -eq 1 ]; then
+  # Everything is ok, run the installer.
+  /bin/echo "Version on disk ($KS_INSTALLED_VERSION) will be updated." | \
+      /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+  # ksinstall already logs to ASL, so output just the minimal amount here:
+  "$KS_SCRIPT_DIR/ksinstall" --recover --install="$KS_INSTALLATION_ARCHIVE"
+  KS_INSTALLATION_RETURN_CODE=$?
+  /bin/echo "Recovery completed. ksinstall exited with $KS_INSTALLATION_RETURN_CODE"| \
+      /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+fi
+
+if [ $KS_RUN_INSTALLER -eq 1 ]; then
+  KS_DATE=$(/bin/date +"%Y%W")
+  KS_KSADMIN=$KS_BUNDLE_FOLDER/MacOS/ksadmin
+  # The code is a simplified version of the Omaha recovery component
+  # experiment label updates
+  if [ $KS_INSTALLATION_RETURN_CODE -eq 0 ]; then
+    KS_RECOVERED_HINT="Recovered_${KS_DATE}R"
+    if [ $KS_IS_MACHINE -eq 0 ] && [ $KS_REGISTRATION_FRAMEWORK -gt 0 ]; then
+      if ( ! $KS_KSADMIN -P com.google.Chrome -p ); then
+        # User installation succeeded, so no system Keystone. Try to recover the
+        # Chrome ticket. Else, Keystone may uninstall itself due to lack of
+        # tickets before Chrome registers self (upon next Chrome run).
+        $KS_KSADMIN --register -P com.google.Chrome \
+            --url https://tools.google.com/service/update2 \
+            --xcpath "$KS_CHROME_PATH" \
+            --version "0.0.0.0" \
+            --version-path "$KS_CHROME_PATH/Contents/Info.plist" \
+            --version-key "KSVersion" 2>&1 | \
+            /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+      fi
+    fi
+  else
+    KS_RECOVERED_HINT="Recovered_${KS_DATE}F"
+  fi
+  $KS_KSADMIN -P com.google.Keystone --cohortHint \
+      "$KS_RECOVERED_HINT" 2>&1 | \
+      /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+fi
+
+# The variables below are used by the FireEventPings
+export KS_PING_SERVER=https://tools.google.com/service/update2
+export KS_SESSION_ID
+KS_SESSION_ID=$(/usr/bin/uuidgen)
+
+
+# Non-critical, diagnostic data
+$KS_SUDO_COMMAND "$KS_SCRIPT_DIR/FireEventPings.sh" "$KS_INSTALLATION_ARCHIVE" \
+  "$KS_INSTALLED_VERSION" "$KS_IS_MACHINE" "$KS_INSTALLATION_RETURN_CODE" \
+  "$KS_EVENT_EXTRA_CODE" "$KS_PING_SERVER" "$KS_INSTALLATION_STARTTIME" "53"\
+  2>&1 | /usr/bin/logger -t "GoogleSoftwareUpdate Recovery"
+
+# Tell Chrome about the result, per Chrome's expected return code
+if [ $KS_INSTALLATION_RETURN_CODE -eq 0 ]; then
+  # EXIT_CODE_RECOVERY_SUCCEEDED
+  exit 0
+elif [ $KS_RUN_INSTALLER -eq 0 ] || \
+     [ $KS_INSTALLATION_RETURN_CODE -eq 18 ]; then
+  # no run or kKSInstallationRecoveryNewerVersionError ->
+  # EXIT_CODE_RECOVERY_SKIPPED
+  exit 1
+elif [ $KS_INSTALLATION_RETURN_CODE -eq 19 ]; then
+  # kKSInstallationRecoverySystemKeystoneError -> EXIT_CODE_ELEVATION_NEEDED
+  exit 2
+else
+  # generic failure
+  exit 3
+fi

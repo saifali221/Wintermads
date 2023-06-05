@@ -1,0 +1,8 @@
+2023/06/05-16:08:03.459 2f03 Reusing MANIFEST /Users/mac2/PycharmProjects/Wintermads/Test/ProfilePath/Profile1/Local Storage/leveldb/MANIFEST-000001
+2023/06/05-16:08:03.459 2f03 Recovering log #24
+2023/06/05-16:08:03.466 2f03 Level-0 table #26: started
+2023/06/05-16:08:03.594 2f03 Level-0 table #26: 18598 bytes OK
+2023/06/05-16:08:03.594 2f03 Recovering log #26
+2023/06/05-16:08:03.597 2f03 Reusing old log /Users/mac2/PycharmProjects/Wintermads/Test/ProfilePath/Profile1/Local Storage/leveldb/000026.log 
+2023/06/05-16:08:03.731 2f03 Delete type=2 #27
+2023/06/05-16:08:03.731 2f03 Delete type=0 #24
